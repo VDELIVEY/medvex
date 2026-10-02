@@ -157,6 +157,20 @@ export async function PATCH(request: Request) {
     };
     if (!transitions[current.status]?.includes(body.status)) return NextResponse.json({ error: `Invalid episode transition from ${current.status} to ${body.status}` }, { status: 409 });
 
+    if (body.status === 'in_consultation' && current.status === 'created') {
+      const { data: settledPayment, error: paymentError } = await supabase
+        .from('payments')
+        .select('id')
+        .eq('episode_id', body.episodeId)
+        .eq('type', 'consultation')
+        .eq('status', 'completed')
+        .not('verified_at', 'is', null)
+        .limit(1)
+        .maybeSingle();
+      if (paymentError) return NextResponse.json({ error: 'Unable to verify consultation payment' }, { status: 500 });
+      if (!settledPayment) return NextResponse.json({ error: 'A completed consultation payment is required before consultation' }, { status: 409 });
+    }
+
     const updates: Record<string, any> = { status: body.status };
     if (body.assignedDoctorId) updates.assigned_doctor_id = body.assignedDoctorId;
     if (body.referralNote !== undefined) updates.referral_note = body.referralNote;

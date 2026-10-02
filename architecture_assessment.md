@@ -1,7 +1,7 @@
 # MedQR Architecture Assessment
 
 **Assessment date:** 2026-10-02  
-**Scope:** Phase 0 audit plus narrow Phase 1 improvements to batch dispensing and PIN-gated patient portal access. This is an implementation assessment, not a production security certification.
+**Scope:** Phase 0 audit plus narrow Phase 1 improvements to batch dispensing, PIN-gated patient portal access, and payment settlement controls. This is an implementation assessment, not a production security certification.
 
 ## Executive Summary
 
@@ -12,7 +12,7 @@ The current architecture is not yet a safe multi-hospital clinical platform. Sta
 ## Current Architecture
 
 - **Web application:** Next.js 14 App Router, React 18, TypeScript. Pages and route handlers live under `src/app`; shared UI is under `src/components`.
-- **Persistence:** Supabase Postgres accessed through `@supabase/supabase-js`. Schema changes are represented by ten SQL migrations in `supabase/migrations`.
+- **Persistence:** Supabase Postgres accessed through `@supabase/supabase-js`. Schema changes are represented by eleven SQL migrations in `supabase/migrations`.
 - **Database model:** Institutions, profiles, staff and staff credentials; patients; episodes; diagnoses; test requests; prescriptions; payments; audit logs; scan notifications; drugs and stock transactions. Episodes associate a patient visit with an institution.
 - **Authentication:** Staff usernames/passwords are checked against bcrypt hashes in `staff_credentials`. `src/lib/session.ts` issues an eight-hour HMAC-signed, HttpOnly cookie with role, staff ID, and institution ID. A separate Supabase Auth/profile model exists but is not the active staff session path.
 - **Authorization:** API handlers call `requireSession` and often pass a hard-coded allowed-role list. There is no permission registry or shared facility-scoping policy. The session contains identity claims but has no server-side revocation/version check.
@@ -70,11 +70,19 @@ The current architecture is not yet a safe multi-hospital clinical platform. Sta
 - Audit is row-change oriented; access/view/export/sharing events, reason/break-glass context, and tamper-resistant privileged operations are not consistently represented.
 - Some high-impact tables/API actions are not covered by the initial audit trigger set. Audit rows are not protected from service-role or database-owner operations by an external immutable archive.
 
+### Resolved in this change: payment confirmation now fails closed
+
+- The generic payment API previously treated arbitrary methods as completed and advanced consultation episodes; mobile-money initiation failure could fall back to that endpoint. Both cashier surfaces also exposed a force-confirm action that bypassed provider verification.
+- Generic payment entry is now restricted to cashier-attested cash received. Mobile/card provider initiation creates a pending payment only; the verification endpoint requires a locally initiated payment and exact provider transaction, amount, and merchant-reference match before recording `verified_at` and completing payment.
+- Unsigned callbacks no longer mutate payment state. The episode API and new database trigger reject movement into consultation without a completed consultation payment carrying a verification timestamp. Repeat mobile initiation returns the existing pending transaction rather than initiating another charge.
+- Apply `supabase/migrations/00000000000010_require_settled_consultation_payment.sql` after the existing payment-tracking migration. It sets new payment status default to pending, adds `verified_at`, and installs the database guard. Existing historical rows are not rewritten; unverified legacy completions do not satisfy the new transition guard.
+- Provider verification queries the first CollectUG transaction-history page and fails closed when a matching, amount/reference-consistent record is not present. Provider pagination/API reliability and staging database behavior still need verification.
+
 ### High: dashboards and workflow labels can misrepresent operations
 
 - `src/app/api/institution/dashboard/route.ts` returns fixed/derived values including 60 assumed beds, a 14-minute wait, and claims calculated as a percentage of revenue; active episodes are used as an occupancy proxy. These are not operational measurements and should not be presented as real metrics.
 - Dashboard requests perform repeated per-day/per-month queries and load rows into application code for counting; these patterns will not scale well.
-- Episode statuses and prescription/payment flows have evolved in migrations and handlers, with duplicated or inconsistent state rules. Workflow changes need centralized transition rules and transactional downstream effects.
+- Episode statuses and remaining prescription/payment flows have evolved across migrations and handlers, with duplicated or inconsistent state rules. Workflow changes need centralized transition rules and transactional downstream effects.
 
 ### Medium: clinical and operational coverage remains partial
 

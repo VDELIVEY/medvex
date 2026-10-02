@@ -74,133 +74,93 @@ function CashierContent() {
   const handlePayment = async () => {
     if (!paymentMethod || !episodeData) return;
     const amount = Number(customAmount) || 1000;
-
-    // Immediately show checking state and start polling
-    setStep('checking');
-    setPollAttempt(1);
-    setCheckingMessage(
-      paymentMethod === 'mobile'
-        ? 'Prompting patient phone and waiting for PIN confirmation...'
-        : 'Connecting to national health payment ledger...'
-    );
-
-    let txnId: string | null = null;
-    let paymentCompleted = false;
-
     try {
-      if (paymentMethod === 'mobile' && phoneNumber) {
-        // Attempt CollectUG deposit initiation
-        try {
-          const cRes = await fetch('/api/payments/collectug', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              episodeId: episodeData.id,
-              amount,
-              phoneNumber: phoneNumber.trim(),
-            }),
-          });
-          const cData = await cRes.json();
-          if (cRes.ok && cData.data?.transaction?.transaction_id) {
-            txnId = cData.data.transaction.transaction_id;
-            if (cData.data.transaction.status === 'completed') {
-              paymentCompleted = true;
-            }
-          }
-        } catch {
-          // Fallback to standard payment recording
-        }
-      }
-
-      if (!paymentCompleted) {
-        // Ensure standard payment record exists
+      if (paymentMethod === 'cash') {
+        setLoading(true);
         const res = await fetch('/api/payments', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             episodeId: episodeData.id,
             amount,
-            method: paymentMethod,
+            method: 'cash',
+            cashReceived: true,
             type: 'consultation',
-            description: `Consultation payment for ${episodeData.episode_code}`,
+            description: `Cash received for consultation ${episodeData.episode_code}`,
           }),
         });
         const data = await res.json();
-        if (data.payment?.receipt_number) {
-          setReceiptNumber(data.payment.receipt_number);
+        if (!res.ok || data.payment?.status !== 'completed') {
+          throw new Error(data.error || 'Cash payment could not be recorded as received.');
         }
+        setReceiptNumber(data.payment.receipt_number || '');
+        setStep('paid');
+        return;
       }
 
-      // Continuous verification polling loop until success
+      if (paymentMethod !== 'mobile') {
+        throw new Error('Card payments are not enabled at this cashier. Use the configured card payment flow.');
+      }
+      if (!phoneNumber.trim()) throw new Error('Enter the patient mobile-money number before continuing.');
+
+      setStep('checking');
+      setPollAttempt(1);
+      setCheckingMessage('Prompting the patient phone and waiting for the mobile-money provider to confirm settlement...');
+      const initiation = await fetch('/api/payments/collectug', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ episodeId: episodeData.id, amount, phoneNumber: phoneNumber.trim() }),
+      });
+      const initiationData = await initiation.json();
+      if (!initiation.ok || !initiationData.success) {
+        throw new Error(initiationData.error || 'Payment request could not be initiated. No payment was recorded as received.');
+      }
+
+      const txnId: string | null = initiationData.data?.transaction?.transaction_id || null;
+      const merchantReference: string | null = initiationData.merchantReference || null;
+      if (!txnId && !merchantReference) {
+        throw new Error('The provider did not return a transaction reference. Payment remains unconfirmed; do not direct the patient to consultation.');
+      }
+
       let attempts = 0;
       const maxAttempts = 15;
-
       const pollInterval = setInterval(async () => {
         attempts++;
         setPollAttempt(attempts);
+        setCheckingMessage(`Verifying settlement directly with CollectUG (attempt ${attempts})...`);
 
-        if (paymentMethod === 'mobile' && txnId) {
-          setCheckingMessage(`Checking transaction status with Mobile Money network (Attempt #${attempts})...`);
-          try {
-            const vRes = await fetch(`/api/payments/verify?transaction_id=${txnId}`);
-            const vData = await vRes.json();
-            if (vData.status === 'completed') {
-              clearInterval(pollInterval);
-              // Ensure episode status is updated to in_consultation
-              await fetch(`/api/episodes`, {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ episodeId: episodeData.id, status: 'in_consultation' }),
-              });
-              setStep('paid');
-              return;
-            }
-          } catch {
-            // continue polling
-          }
-        } else {
-          setCheckingMessage(`Verifying settlement & active consultation queue (Attempt #${attempts})...`);
-        }
-
-        // Check if episode has been set to in_consultation or payment recorded
         try {
-          const epRes = await fetch(`/api/episodes?code=${encodeURIComponent(episodeData.episode_code)}`);
-          const epData = await epRes.json();
-          if (epData.episode?.status === 'in_consultation') {
+          const verifyUrl = txnId
+            ? `/api/payments/verify?transaction_id=${encodeURIComponent(txnId)}`
+            : `/api/payments/verify?merchant_reference=${encodeURIComponent(merchantReference!)}`;
+          const verifyResponse = await fetch(verifyUrl);
+          const verification = await verifyResponse.json();
+          if (verifyResponse.ok && verification.status === 'completed') {
             clearInterval(pollInterval);
-            // Ensure status is definitely in_consultation
-            await fetch(`/api/episodes`, {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ episodeId: episodeData.id, status: 'in_consultation' }),
-            }).catch(() => {});
+            setReceiptNumber(verification.receiptNumber || '');
             setStep('paid');
             return;
           }
+          if (verification.status === 'failed' || verification.status === 'cancelled') {
+            clearInterval(pollInterval);
+            setCheckingMessage('The provider reports that this payment failed. The episode remains unpaid. You may return and retry.');
+            return;
+          }
         } catch {
-          // continue polling
+          setCheckingMessage('Provider verification is temporarily unavailable. This payment remains pending.');
         }
 
         if (attempts >= maxAttempts) {
           clearInterval(pollInterval);
-          setCheckingMessage('Automatic verification pending. If the patient has paid, click "Instant Confirm" below.');
+          setCheckingMessage('No settlement confirmation received. This payment remains pending; do not mark it as paid. Check the provider transaction before retrying.');
         }
-      }, 1500);
-
+      }, 2000);
     } catch (err) {
-      setCheckingMessage('Verification encountered an issue. If the patient has paid, click "Instant Confirm" below.');
+      setCheckingMessage(err instanceof Error ? err.message : 'Payment could not be verified. It remains unpaid.');
+      if (paymentMethod === 'cash') setStep('payment');
+    } finally {
+      setLoading(false);
     }
-  };
-
-  const forceConfirm = async () => {
-    try {
-      await fetch(`/api/episodes`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ episodeId: episodeData.id, status: 'in_consultation' }),
-      });
-    } catch {}
-    setStep('paid');
   };
 
   const reset = () => {
@@ -344,9 +304,9 @@ function CashierContent() {
               />
               <PaymentOption 
                 icon={<CreditCard />} 
-                label="Health Card" 
-                active={paymentMethod === 'card'} 
-                onClick={() => setPaymentMethod('card')} 
+                label="Card (Unavailable)" 
+                active={false}
+                disabled
               />
             </div>
           </div>
@@ -375,7 +335,7 @@ function CashierContent() {
             disabled={!paymentMethod || loading || !customAmount || Number(customAmount) <= 0}
           >
             <ShieldCheck className="w-6 h-6" />
-            {paymentMethod === 'mobile' ? 'Pay & Check Confirmation' : 'Confirm Cash / Card Payment'}
+            {paymentMethod === 'mobile' ? 'Request & Verify Mobile Payment' : paymentMethod === 'cash' ? 'Confirm Cash Received' : 'Card Payment Unavailable'}
           </button>
         </div>
       )}
@@ -419,14 +379,6 @@ function CashierContent() {
           </div>
 
           <div className="flex items-center justify-center gap-4">
-            <button
-              type="button"
-              onClick={forceConfirm}
-              className="btn btn-primary py-3 px-6 text-sm font-bold shadow-md flex items-center gap-2"
-            >
-              <CheckCircle2 className="w-4 h-4" />
-              Instant Confirm
-            </button>
             <button
               type="button"
               onClick={() => setStep('payment')}
@@ -489,11 +441,12 @@ function CashierContent() {
   );
 }
 
-function PaymentOption({ icon, label, active, onClick }: any) {
+function PaymentOption({ icon, label, active, onClick, disabled = false }: any) {
   return (
     <div 
-      onClick={onClick}
-      className={`p-6 rounded-3xl border-2 cursor-pointer transition-all flex flex-col items-center gap-3 ${
+      onClick={disabled ? undefined : onClick}
+      aria-disabled={disabled}
+      className={`p-6 rounded-3xl border-2 transition-all flex flex-col items-center gap-3 ${disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${
         active 
           ? 'border-amber-500 bg-amber-50 text-amber-600 shadow-lg scale-105' 
           : 'border-gray-100 bg-white hover:border-amber-200 text-gray-400'

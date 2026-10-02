@@ -33,6 +33,7 @@ export default function CollectUGPaymentModal({
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingTxnId, setPendingTxnId] = useState<string | null>(null);
+  const [pendingMerchantReference, setPendingMerchantReference] = useState<string | null>(null);
   const [isAutoConfirmed, setIsAutoConfirmed] = useState<boolean>(false);
   const [manualChecking, setManualChecking] = useState<boolean>(false);
   const [noTxnId, setNoTxnId] = useState<boolean>(false);
@@ -106,6 +107,7 @@ export default function CollectUGPaymentModal({
     setError(null);
     setIsAutoConfirmed(false);
     setPendingTxnId(null);
+    setPendingMerchantReference(null);
     setManualChecking(false);
     pollCountRef.current = 0;
 
@@ -144,13 +146,13 @@ export default function CollectUGPaymentModal({
       }
 
       const txnId = data.data?.transaction?.transaction_id;
-      const initialStatus = data.data?.transaction?.status;
-
-      if (initialStatus === 'completed') {
-        setIsAutoConfirmed(true);
-        setLoading(false);
-      } else if (txnId) {
+      const merchantReference = data.merchantReference;
+      setPendingMerchantReference(merchantReference || null);
+      if (txnId) {
         setPendingTxnId(txnId);
+      } else if (merchantReference) {
+        setNoTxnId(true);
+        setLoading(false);
       } else {
         setNoTxnId(true);
         setLoading(false);
@@ -172,47 +174,19 @@ export default function CollectUGPaymentModal({
     setManualChecking(true);
     setError(null);
     try {
-      const payload: any = {
-        episodeId,
-        amount: Number(amount),
-        customerEmail: customerEmail || undefined,
-      };
-
-      if (paymentMethod === 'momo') {
-        payload.phoneNumber = phoneNumber;
-      } else {
-        payload.cardNumber = cardNumber;
-        payload.cardholderName = cardholderName;
-        payload.expiryDate = expiryDate;
-        payload.cvv = cvv;
-      }
-
-      const res = await fetch('/api/payments/collectug', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-
+      if (!pendingMerchantReference) throw new Error('No provider reference is available for verification. Payment remains unconfirmed.');
+      const res = await fetch(`/api/payments/verify?merchant_reference=${encodeURIComponent(pendingMerchantReference)}`);
       const data = await res.json();
-
-      if (!res.ok || !data.success) {
-        throw new Error(data.error || 'Manual status check failed.');
-      }
-
-      const txnId = data.data?.transaction?.transaction_id;
-      const initialStatus = data.data?.transaction?.status;
-
-      if (initialStatus === 'completed') {
+      if (!res.ok || !data.success) throw new Error(data.error || 'Payment verification failed.');
+      if (data.status === 'completed') {
         setIsAutoConfirmed(true);
         setLoading(false);
         setPendingTxnId(null);
-      } else if (txnId) {
-        setPendingTxnId(txnId);
-        setError(null);
+        if (onSuccess) onSuccess(data.transaction);
+      } else if (data.status === 'failed' || data.status === 'cancelled') {
+        setError('The provider reports this payment failed. The episode remains unpaid.');
       } else {
-        setError(
-          'Still no transaction reference received. If money was deducted from the patient\'s phone, keep this screen open and try again in a few seconds.'
-        );
+        setError('No settlement confirmation yet. Payment remains pending.');
       }
     } catch (err: any) {
       setError(err.message || 'Manual check failed.');
@@ -221,29 +195,10 @@ export default function CollectUGPaymentModal({
     }
   };
 
-  const handleInstantConfirm = async () => {
-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-    try {
-      if (episodeId) {
-        await fetch(`/api/episodes`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ episodeId, status: 'in_consultation' }),
-        }).catch(() => {});
-      }
-    } catch (err) {
-      console.error('Instant confirm error:', err);
-    }
-    setIsAutoConfirmed(true);
-    setLoading(false);
-    if (onSuccess) {
-      onSuccess({ transaction_id: pendingTxnId || 'manual', status: 'completed' });
-    }
-  };
-
   const handleCloseModal = () => {
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     setPendingTxnId(null);
+    setPendingMerchantReference(null);
     setIsAutoConfirmed(false);
     setNoTxnId(false);
     onClose();
@@ -325,14 +280,6 @@ export default function CollectUGPaymentModal({
                 )}
               </button>
 
-              <button
-                type="button"
-                onClick={handleInstantConfirm}
-                className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl shadow-lg transition-all flex items-center justify-center space-x-2"
-              >
-                <CheckCircle2 className="w-5 h-5" />
-                <span>Instant Confirm (Payment Received)</span>
-              </button>
             </div>
           </div>
         ) : pendingTxnId ? (
@@ -354,15 +301,6 @@ export default function CollectUGPaymentModal({
               <RefreshCw className="w-4 h-4 animate-spin" />
               <span>Waiting for automatic confirmation...</span>
             </div>
-
-            <button
-              type="button"
-              onClick={handleInstantConfirm}
-              className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl shadow-lg transition-all flex items-center justify-center space-x-2"
-            >
-              <CheckCircle2 className="w-5 h-5" />
-              <span>Instant Confirm (Payment Received)</span>
-            </button>
 
             {error && (
               <div className="p-3 bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800 rounded-xl text-red-600 dark:text-red-400 text-xs flex items-center space-x-2">
