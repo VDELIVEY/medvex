@@ -1,0 +1,11 @@
+node_modules/
+.next/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+*.sql
+!supabase/migrations/*.sql
+.idea/
+*.zip
+node_modules - Copy/
